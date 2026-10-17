@@ -296,10 +296,12 @@ static int register_scope_at(struct cgroup_resolver *res,
     parse_memory_max(scope_path, &c->limits);
     parse_pids_max(scope_path,   &c->limits);
 
-    fetch_container_name(full_id, scope_path, c->name, sizeof(c->name));
-
-    int is_rootless = (strstr(scope_path, "/user@") != NULL);
-
+    /*
+     * Push limits to the BPF map BEFORE name resolution.
+     * fetch_container_name() can be slow for rootless containers
+     * (it runs `runuser` + `podman inspect`).  Starting BPF tracking
+     * immediately ensures no CPU slices are missed during that window.
+     */
     int err = bpf_map_update_elem(res->limits_map_fd, &cgid, &c->limits,
                                    BPF_ANY);
     if (err) {
@@ -307,6 +309,10 @@ static int register_scope_at(struct cgroup_resolver *res,
                   (unsigned long long)cgid, strerror(errno));
         return err;
     }
+
+    fetch_container_name(full_id, scope_path, c->name, sizeof(c->name));
+
+    int is_rootless = (strstr(scope_path, "/user@") != NULL);
 
     LOG_INFO("container registered: name=%-20s id=%.12s cgid=%-6llu "
              "cpu_quota=%s mem_limit=%s%s",
