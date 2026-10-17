@@ -57,5 +57,10 @@ int cgroup_resolver_get_inotify_fd(const struct cgroup_resolver *res);
 const struct ct_container *cgroup_resolver_find_by_cgid(
         const struct cgroup_resolver *res, uint64_t cgid);
 
+/* Iterate over registered containers (for periodic stats). */
+int cgroup_resolver_get_count(const struct cgroup_resolver *res);
+const struct ct_container *cgroup_resolver_get_container(
+        const struct cgroup_resolver *res, int idx);
+
 /* Release all resources. */
 void cgroup_resolver_destroy(struct cgroup_resolver *res);

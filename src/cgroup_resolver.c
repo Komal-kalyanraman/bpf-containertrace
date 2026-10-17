@@ -2,21 +2,20 @@
 /*
  * cgroup_resolver.c – Podman container discovery via cgroup v2 + inotify
  *
- * Watches /sys/fs/cgroup/machine.slice/ for directories matching the pattern
- * "libpod-<container_id>.scope".  For each such scope the resolver:
+ * Discovers containers for BOTH root Podman and rootless Podman:
  *
- *   1. Locates the leaf cgroup where tasks actually run.
- *      Podman (systemd cgroup manager) places container processes in
- *      <scope>/container/.  If that subdir is absent the scope itself is
- *      used as the leaf.
+ *   Root Podman:     /sys/fs/cgroup/machine.slice/libpod-<id>.scope/
+ *   Rootless Podman: /sys/fs/cgroup/user.slice/user-<uid>.slice/
+ *                        user@<uid>.service/user.slice/libpod-<id>.scope/
  *
- *   2. Reads cpu.max, memory.max, pids.max from the scope directory to
- *      build a struct ct_limits.
- *
- *   3. Registers (cgid → limits) in the BPF container_limits map so the
- *      kernel-side sched_switch handler starts tracking the container.
- *
- *   4. Removes the entry when the scope directory disappears.
+ * Discovery strategy:
+ *   1. Initial recursive scan of CGROUP_ROOT for libpod-*.scope dirs.
+ *      Only traverses directories that can contain Podman scopes
+ *      (machine.slice, user.slice, user-*.slice, user@*.service).
+ *   2. inotify watches on machine.slice + all relevant user session dirs,
+ *      with dynamic watch creation when new session dirs appear.
+ *   3. Periodic rescan (triggered by caller) as a safety net for any
+ *      events missed by inotify.
  */
 
 #include <stdio.h>
@@ -40,61 +39,72 @@
 /* Constants                                                           */
 /* ------------------------------------------------------------------ */
 
-#define MACHINE_SLICE      "/sys/fs/cgroup/machine.slice"
-#define SCOPE_PREFIX       "libpod-"
-#define CONMON_PREFIX      "libpod-conmon-"
-#define INNER_CGROUP       "container"
+#define CGROUP_ROOT          "/sys/fs/cgroup"
+#define MACHINE_SLICE        CGROUP_ROOT "/machine.slice"
+#define USER_SLICE_ROOT      CGROUP_ROOT "/user.slice"
 
-/* How many times to retry looking for the inner container/ subdir. */
-#define INNER_RETRY_MAX    10
-#define INNER_RETRY_US     20000   /* 20 ms between retries */
+#define SCOPE_PREFIX         "libpod-"
+#define CONMON_PREFIX        "libpod-conmon-"
+#define INNER_CGROUP         "container"
 
-/* Maximum CPU quota / period value from cpu.max ("max" keyword). */
-#define CPU_MAX_UNLIMITED  UINT64_MAX
+#define MAX_SCAN_DEPTH       6
+#define MAX_INOTIFY_WATCHES  48
+#define INNER_RETRY_MAX      10
+#define INNER_RETRY_US       20000  /* 20 ms */
 
 /* ------------------------------------------------------------------ */
-/* Internal resolver state                                             */
+/* Internal types                                                      */
 /* ------------------------------------------------------------------ */
+
+/* One inotify watch: maps a watch descriptor → the watched directory path. */
+struct watch_dir {
+    int  wd;
+    char path[CT_PATH_LEN];
+};
 
 struct cgroup_resolver {
     struct ct_container containers[CT_MAX_CONTAINERS];
-    int  count;
-    int  inotify_fd;
-    int  watch_fd;        /* inotify watch on MACHINE_SLICE */
-    int  limits_map_fd;   /* BPF container_limits map */
-    int  stats_map_fd;    /* BPF container_cpu_stats map */
+    int                 count;
+    int                 inotify_fd;
+    struct watch_dir    watches[MAX_INOTIFY_WATCHES];
+    int                 num_watches;
+    int                 limits_map_fd;
+    int                 stats_map_fd;
 };
 
 /* ------------------------------------------------------------------ */
-/* Helpers – cgroup file parsers                                       */
+/* Forward declarations                                                */
 /* ------------------------------------------------------------------ */
 
-/*
- * Parse /sys/fs/cgroup/<path>/cpu.max
- * Format: "<quota_us> <period_us>" or "max <period_us>"
- */
+static int  register_scope_at(struct cgroup_resolver *res,
+                                const char *scope_path);
+static void deregister_scope_at(struct cgroup_resolver *res,
+                                  const char *scope_path);
+static int  add_watch(struct cgroup_resolver *res, const char *path);
+static void setup_watches_recursive(struct cgroup_resolver *res,
+                                     const char *dir, int depth);
+static void scan_for_scopes(struct cgroup_resolver *res,
+                             const char *dir, int depth, int *count);
+
+/* ------------------------------------------------------------------ */
+/* cgroup file parsers                                                 */
+/* ------------------------------------------------------------------ */
+
 static void parse_cpu_max(const char *scope_path, struct ct_limits *lim)
 {
     char path[CT_PATH_LEN + 16];
     snprintf(path, sizeof(path), "%s/cpu.max", scope_path);
-
     FILE *f = fopen(path, "r");
     if (!f) {
         lim->cpu_quota_ns  = 0;
-        lim->cpu_period_ns = 100000000ULL; /* default 100 ms */
+        lim->cpu_period_ns = 100000000ULL;
         return;
     }
-
     char quota_str[32] = {0};
     unsigned long long period_us = 100000;
-
     if (fscanf(f, "%31s %llu", quota_str, &period_us) == 2) {
-        if (strcmp(quota_str, "max") == 0) {
-            lim->cpu_quota_ns = 0; /* unlimited */
-        } else {
-            unsigned long long quota_us = strtoull(quota_str, NULL, 10);
-            lim->cpu_quota_ns = quota_us * 1000ULL;
-        }
+        lim->cpu_quota_ns  = (strcmp(quota_str, "max") == 0)
+                             ? 0 : strtoull(quota_str, NULL, 10) * 1000ULL;
         lim->cpu_period_ns = period_us * 1000ULL;
     } else {
         lim->cpu_quota_ns  = 0;
@@ -103,129 +113,107 @@ static void parse_cpu_max(const char *scope_path, struct ct_limits *lim)
     fclose(f);
 }
 
-/*
- * Parse /sys/fs/cgroup/<path>/memory.max
- * Format: "<bytes>" or "max"
- */
 static void parse_memory_max(const char *scope_path, struct ct_limits *lim)
 {
     char path[CT_PATH_LEN + 20];
     snprintf(path, sizeof(path), "%s/memory.max", scope_path);
-
     FILE *f = fopen(path, "r");
     if (!f) { lim->mem_limit = 0; return; }
-
     char buf[32] = {0};
-    if (fscanf(f, "%31s", buf) == 1) {
-        lim->mem_limit = (strcmp(buf, "max") == 0)
-                         ? 0
-                         : strtoull(buf, NULL, 10);
-    } else {
-        lim->mem_limit = 0;
-    }
+    if (fscanf(f, "%31s", buf) == 1)
+        lim->mem_limit = strcmp(buf, "max") == 0 ? 0 : strtoull(buf, NULL, 10);
     fclose(f);
 }
 
-/*
- * Parse /sys/fs/cgroup/<path>/pids.max
- * Format: "<count>" or "max"
- */
 static void parse_pids_max(const char *scope_path, struct ct_limits *lim)
 {
     char path[CT_PATH_LEN + 16];
     snprintf(path, sizeof(path), "%s/pids.max", scope_path);
-
     FILE *f = fopen(path, "r");
     if (!f) { lim->pids_max = 0; return; }
-
     char buf[32] = {0};
-    if (fscanf(f, "%31s", buf) == 1) {
-        lim->pids_max = (strcmp(buf, "max") == 0)
-                        ? 0
-                        : strtoull(buf, NULL, 10);
-    } else {
-        lim->pids_max = 0;
-    }
+    if (fscanf(f, "%31s", buf) == 1)
+        lim->pids_max = strcmp(buf, "max") == 0 ? 0 : strtoull(buf, NULL, 10);
     fclose(f);
 }
 
 /* ------------------------------------------------------------------ */
-/* Helpers – container metadata                                        */
+/* Container ID extraction                                             */
 /* ------------------------------------------------------------------ */
 
-/*
- * Extract the full container ID from a scope directory name.
- * Input:  "libpod-abc123....scope"
- * Output: "abc123...."  (up to CT_CONTAINER_ID_LEN-1 chars, NUL-terminated)
- */
 static void extract_id(const char *scope_name, char *id_out, size_t len)
 {
     const char *start = scope_name + strlen(SCOPE_PREFIX);
-    /* Strip trailing ".scope" */
     size_t n = strlen(start);
     if (n > 6 && strcmp(start + n - 6, ".scope") == 0)
         n -= 6;
-    if (n >= len)
-        n = len - 1;
+    if (n >= len) n = len - 1;
     memcpy(id_out, start, n);
     id_out[n] = '\0';
 }
 
-/*
- * Query Podman for the human-readable container name.
- * Falls back to the first 12 chars of the container ID.
- */
-static void fetch_container_name(const char *full_id,
-                                  char *name_out, size_t name_len)
-{
-    char cmd[256];
-    /* Use --format without a leading slash – Podman names have no '/'. */
-    snprintf(cmd, sizeof(cmd),
-             "podman inspect --format '{{.Name}}' %.64s 2>/dev/null",
-             full_id);
+/* ------------------------------------------------------------------ */
+/* Container name resolution                                           */
+/* ------------------------------------------------------------------ */
 
-    FILE *f = popen(cmd, "r");
-    if (f) {
-        if (fgets(name_out, (int)name_len, f)) {
-            /* Strip trailing newline */
-            char *nl = strchr(name_out, '\n');
-            if (nl) *nl = '\0';
-        } else {
-            f = NULL; /* fall through to fallback */
+/*
+ * Resolve the human-readable Podman container name.
+ *
+ * For root Podman:     run `podman inspect` directly.
+ * For rootless Podman: the container DB is owned by the user; extract the
+ *                      UID from the cgroup path and `runuser` as that UID.
+ * Falls back to the 12-character short container ID on any failure.
+ */
+static void fetch_container_name(const char *full_id, const char *scope_path,
+                                   char *name_out, size_t name_len)
+{
+    name_out[0] = '\0';
+
+    char cmd[512];
+    int  is_rootless = (strstr(scope_path, "/user@") != NULL);
+
+    if (is_rootless) {
+        /* Extract UID from "/user-<uid>.slice/" in the path. */
+        const char *p = strstr(scope_path, "/user-");
+        unsigned long uid = p ? strtoul(p + 6, NULL, 10) : 0;
+        if (uid > 0) {
+            snprintf(cmd, sizeof(cmd),
+                     "runuser -u \"$(getent passwd %lu 2>/dev/null"
+                     " | cut -d: -f1 || echo '#%lu')\" -- "
+                     "podman inspect --format '{{.Name}}' %.64s 2>/dev/null",
+                     uid, uid, full_id);
+            FILE *f = popen(cmd, "r");
+            if (f) {
+                fgets(name_out, (int)name_len, f);
+                pclose(f);
+            }
         }
-        pclose(f);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "podman inspect --format '{{.Name}}' %.64s 2>/dev/null",
+                 full_id);
+        FILE *f = popen(cmd, "r");
+        if (f) {
+            fgets(name_out, (int)name_len, f);
+            pclose(f);
+        }
     }
 
-    /* Fallback: use a 12-char short ID if name is empty */
-    if (!f || name_out[0] == '\0')
+    char *nl = strchr(name_out, '\n');
+    if (nl) *nl = '\0';
+
+    if (!name_out[0])
         snprintf(name_out, name_len, "%.12s", full_id);
 }
 
 /* ------------------------------------------------------------------ */
-/* Core registration / deregistration                                  */
+/* Leaf cgroup finder                                                  */
 /* ------------------------------------------------------------------ */
 
 /*
- * Find an existing slot by container ID, or allocate a free slot.
- * Returns NULL if the table is full.
- */
-static struct ct_container *find_or_alloc(struct cgroup_resolver *res,
-                                           const char *id)
-{
-    for (int i = 0; i < res->count; i++) {
-        if (strcmp(res->containers[i].id, id) == 0)
-            return &res->containers[i];
-    }
-    if (res->count >= CT_MAX_CONTAINERS)
-        return NULL;
-    return &res->containers[res->count++];
-}
-
-/*
- * Determine the cgroup path where actual tasks run.
- * Podman places tasks inside <scope>/container/.
- * Retries up to INNER_RETRY_MAX times to handle the window between
- * the scope dir appearing and the inner dir being created.
+ * Determine the cgroup where container tasks actually run.
+ * Podman places tasks inside <scope>/container/ with a short retry window
+ * to handle the race between scope creation and inner cgroup setup.
  */
 static int find_leaf_cgroup(const char *scope_path,
                               char *leaf_out, size_t leaf_len,
@@ -241,120 +229,251 @@ static int find_leaf_cgroup(const char *scope_path,
             *cgid_out = (uint64_t)st.st_ino;
             return 0;
         }
-        /* Inner cgroup not yet created; check the scope itself. */
         if (stat(scope_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (attempt < 2) { usleep(INNER_RETRY_US); continue; }
             snprintf(leaf_out, leaf_len, "%s", scope_path);
             *cgid_out = (uint64_t)st.st_ino;
-            /* If this is the first attempt, try once more for inner. */
-            if (attempt < 2) {
-                usleep(INNER_RETRY_US);
-                continue;
-            }
             return 0;
         }
-        /* Scope has disappeared (race with container stop). */
         return -ENOENT;
     }
     return -ENOENT;
 }
 
-/*
- * Register a Podman container scope with the BPF maps.
- */
-static int register_scope(struct cgroup_resolver *res,
-                           const char *scope_name)
+/* ------------------------------------------------------------------ */
+/* Container table helpers                                             */
+/* ------------------------------------------------------------------ */
+
+static struct ct_container *find_or_alloc(struct cgroup_resolver *res,
+                                           const char *id)
 {
-    /* Skip the conmon monitor process scope. */
+    for (int i = 0; i < res->count; i++)
+        if (strcmp(res->containers[i].id, id) == 0)
+            return &res->containers[i];
+    if (res->count >= CT_MAX_CONTAINERS) return NULL;
+    return &res->containers[res->count++];
+}
+
+/* ------------------------------------------------------------------ */
+/* Scope registration / deregistration                                 */
+/* ------------------------------------------------------------------ */
+
+static int register_scope_at(struct cgroup_resolver *res,
+                               const char *scope_path)
+{
+    const char *scope_name = strrchr(scope_path, '/');
+    scope_name = scope_name ? scope_name + 1 : scope_path;
+
     if (strncmp(scope_name, CONMON_PREFIX, strlen(CONMON_PREFIX)) == 0)
         return 0;
     if (strncmp(scope_name, SCOPE_PREFIX, strlen(SCOPE_PREFIX)) != 0)
         return 0;
 
-    char scope_path[CT_PATH_LEN];
-    snprintf(scope_path, sizeof(scope_path),
-             MACHINE_SLICE "/%s", scope_name);
+    char full_id[CT_CONTAINER_ID_LEN];
+    extract_id(scope_name, full_id, sizeof(full_id));
 
-    /* Determine the leaf cgroup (where tasks actually live). */
+    struct ct_container *c = find_or_alloc(res, full_id);
+    if (!c) {
+        LOG_WARN("container table full, dropping %.12s", full_id);
+        return -ENOMEM;
+    }
+
+    /* Already registered at the same path — nothing to do. */
+    if (c->cgid != 0 && strcmp(c->scope_path, scope_path) == 0)
+        return 0;
+
     char leaf_path[CT_PATH_LEN];
     uint64_t cgid = 0;
     if (find_leaf_cgroup(scope_path, leaf_path, sizeof(leaf_path), &cgid) != 0)
         return -ENOENT;
 
-    /* Extract full container ID. */
-    char full_id[CT_CONTAINER_ID_LEN];
-    extract_id(scope_name, full_id, sizeof(full_id));
-
-    /* Allocate or refresh slot. */
-    struct ct_container *c = find_or_alloc(res, full_id);
-    if (!c) {
-        LOG_WARN("container table full, dropping %s", full_id);
-        return -ENOMEM;
-    }
-
-    strncpy(c->id, full_id, sizeof(c->id) - 1);
+    strncpy(c->id,         full_id,    sizeof(c->id)         - 1);
     strncpy(c->scope_path, scope_path, sizeof(c->scope_path) - 1);
-    strncpy(c->leaf_path, leaf_path, sizeof(c->leaf_path) - 1);
+    strncpy(c->leaf_path,  leaf_path,  sizeof(c->leaf_path)  - 1);
     c->cgid = cgid;
 
-    /* Parse limits from the scope level (not the inner cgroup). */
-    parse_cpu_max(scope_path, &c->limits);
+    parse_cpu_max(scope_path,    &c->limits);
     parse_memory_max(scope_path, &c->limits);
-    parse_pids_max(scope_path, &c->limits);
+    parse_pids_max(scope_path,   &c->limits);
 
-    /* Resolve human-readable name via Podman (one-time on start). */
-    fetch_container_name(full_id, c->name, sizeof(c->name));
+    fetch_container_name(full_id, scope_path, c->name, sizeof(c->name));
 
-    /* Push limits into the BPF map. */
+    int is_rootless = (strstr(scope_path, "/user@") != NULL);
+
     int err = bpf_map_update_elem(res->limits_map_fd, &cgid, &c->limits,
                                    BPF_ANY);
     if (err) {
-        LOG_ERROR("bpf_map_update_elem(limits) cgid=%llu: %s",
+        LOG_ERROR("bpf_map_update_elem cgid=%llu: %s",
                   (unsigned long long)cgid, strerror(errno));
         return err;
     }
 
     LOG_INFO("container registered: name=%-20s id=%.12s cgid=%-6llu "
-             "cpu_quota=%s mem_limit=%s",
-             c->name, c->id,
-             (unsigned long long)cgid,
-             c->limits.cpu_quota_ns ? "set" : "unlimited",
-             c->limits.mem_limit    ? "set" : "unlimited");
+             "cpu_quota=%s mem_limit=%s%s",
+             c->name, c->id, (unsigned long long)cgid,
+             c->limits.cpu_quota_ns ? "set"       : "unlimited",
+             c->limits.mem_limit    ? "set"       : "unlimited",
+             is_rootless            ? " (rootless)" : "");
     return 0;
 }
 
-/*
- * Deregister a container when its scope directory disappears.
- */
-static void deregister_scope(struct cgroup_resolver *res,
-                              const char *scope_name)
+static void deregister_scope_at(struct cgroup_resolver *res,
+                                  const char *scope_path)
 {
-    if (strncmp(scope_name, CONMON_PREFIX, strlen(CONMON_PREFIX)) == 0)
-        return;
-    if (strncmp(scope_name, SCOPE_PREFIX, strlen(SCOPE_PREFIX)) != 0)
-        return;
+    const char *scope_name = strrchr(scope_path, '/');
+    scope_name = scope_name ? scope_name + 1 : scope_path;
+
+    if (strncmp(scope_name, CONMON_PREFIX, strlen(CONMON_PREFIX)) == 0) return;
+    if (strncmp(scope_name, SCOPE_PREFIX, strlen(SCOPE_PREFIX)) != 0)   return;
 
     char full_id[CT_CONTAINER_ID_LEN];
     extract_id(scope_name, full_id, sizeof(full_id));
 
     for (int i = 0; i < res->count; i++) {
-        if (strcmp(res->containers[i].id, full_id) != 0)
-            continue;
+        if (strcmp(res->containers[i].id, full_id) != 0) continue;
 
         struct ct_container *c = &res->containers[i];
-
-        /* Remove from BPF maps. */
         bpf_map_delete_elem(res->limits_map_fd, &c->cgid);
         bpf_map_delete_elem(res->stats_map_fd,  &c->cgid);
 
-        LOG_INFO("container deregistered: name=%-20s id=%.12s",
-                 c->name, c->id);
+        LOG_INFO("container deregistered: name=%-20s id=%.12s", c->name, c->id);
 
-        /* Compact the array by swapping with the last entry. */
         res->count--;
         if (i < res->count)
             res->containers[i] = res->containers[res->count];
         return;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* inotify watch management                                            */
+/* ------------------------------------------------------------------ */
+
+static int add_watch(struct cgroup_resolver *res, const char *path)
+{
+    /* Avoid duplicate watches. */
+    for (int i = 0; i < res->num_watches; i++)
+        if (strcmp(res->watches[i].path, path) == 0)
+            return res->watches[i].wd;
+
+    if (res->num_watches >= MAX_INOTIFY_WATCHES) {
+        LOG_WARN("max inotify watches reached, skipping %s", path);
+        return -1;
+    }
+
+    int wd = inotify_add_watch(res->inotify_fd, path,
+                               IN_CREATE | IN_DELETE | IN_MOVED_FROM |
+                               IN_MOVED_TO | IN_DELETE_SELF);
+    if (wd < 0)
+        return -1;
+
+    res->watches[res->num_watches].wd = wd;
+    snprintf(res->watches[res->num_watches].path, CT_PATH_LEN, "%s", path);
+    res->num_watches++;
+
+    LOG_DEBUG("inotify watch: %s (wd=%d)", path, wd);
+    return wd;
+}
+
+static const char *find_watch_path(const struct cgroup_resolver *res, int wd)
+{
+    for (int i = 0; i < res->num_watches; i++)
+        if (res->watches[i].wd == wd) return res->watches[i].path;
+    return NULL;
+}
+
+static void remove_watch_by_wd(struct cgroup_resolver *res, int wd)
+{
+    for (int i = 0; i < res->num_watches; i++) {
+        if (res->watches[i].wd != wd) continue;
+        res->num_watches--;
+        if (i < res->num_watches)
+            res->watches[i] = res->watches[res->num_watches];
+        return;
+    }
+}
+
+/*
+ * Returns true for directory names that could contain libpod-*.scope
+ * as children (directly or via further nesting).  Used both when
+ * deciding what to recurse into during scanning and what new dirs
+ * to add inotify watches to.
+ *
+ *   machine.slice          → contains root Podman scopes directly
+ *   user.slice             → contains user-*.slice (at any level)
+ *   user-<uid>.slice       → contains user@<uid>.service
+ *   user@<uid>.service     → contains inner user.slice
+ */
+static int should_traverse(const char *dirname)
+{
+    return (strcmp(dirname,        "machine.slice") == 0 ||
+            strcmp(dirname,        "user.slice")    == 0 ||
+            strncmp(dirname, "user-", 5)            == 0 ||
+            strncmp(dirname, "user@", 5)            == 0);
+}
+
+/*
+ * Recursively add inotify watches on dirs that could host libpod-*.scope.
+ * Called at init time on existing user session dirs.
+ */
+static void setup_watches_recursive(struct cgroup_resolver *res,
+                                     const char *dir, int depth)
+{
+    if (depth <= 0) return;
+
+    DIR *d = opendir(dir);
+    if (!d) return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        if (ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN) continue;
+        if (!should_traverse(ent->d_name)) continue;
+
+        char path[CT_PATH_LEN * 2];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+
+        add_watch(res, path);
+        setup_watches_recursive(res, path, depth - 1);
+    }
+    closedir(d);
+}
+
+/*
+ * Recursively scan for libpod-*.scope directories.
+ * Traverses only the dirs in should_traverse() so the walk is fast
+ * even on a busy system (skips all unrelated cgroup subtrees).
+ */
+static void scan_for_scopes(struct cgroup_resolver *res,
+                              const char *dir, int depth, int *count)
+{
+    if (depth <= 0) return;
+
+    DIR *d = opendir(dir);
+    if (!d) return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        if (ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN) continue;
+
+        char path[CT_PATH_LEN * 2];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+
+        if (strncmp(ent->d_name, SCOPE_PREFIX, strlen(SCOPE_PREFIX)) == 0) {
+            struct stat st;
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                if (register_scope_at(res, path) == 0 && count)
+                    (*count)++;
+            }
+        } else if (should_traverse(ent->d_name)) {
+            scan_for_scopes(res, path, depth - 1, count);
+        }
+    }
+    closedir(d);
 }
 
 /* ------------------------------------------------------------------ */
@@ -365,8 +484,7 @@ struct cgroup_resolver *cgroup_resolver_init(int limits_map_fd,
                                               int stats_map_fd)
 {
     struct cgroup_resolver *res = calloc(1, sizeof(*res));
-    if (!res)
-        return NULL;
+    if (!res) return NULL;
 
     res->limits_map_fd = limits_map_fd;
     res->stats_map_fd  = stats_map_fd;
@@ -378,73 +496,96 @@ struct cgroup_resolver *cgroup_resolver_init(int limits_map_fd,
         return NULL;
     }
 
-    res->watch_fd = inotify_add_watch(res->inotify_fd, MACHINE_SLICE,
-                                       IN_CREATE | IN_DELETE |
-                                       IN_MOVED_FROM | IN_MOVED_TO);
-    if (res->watch_fd < 0) {
-        LOG_ERROR("inotify_add_watch(%s): %s", MACHINE_SLICE, strerror(errno));
-        close(res->inotify_fd);
-        free(res);
-        return NULL;
-    }
+    /* Watch machine.slice (root Podman). */
+    if (add_watch(res, MACHINE_SLICE) < 0)
+        LOG_WARN("Could not watch %s: %s", MACHINE_SLICE, strerror(errno));
+
+    /* Watch user.slice top-level so we see new user sessions arrive. */
+    if (add_watch(res, USER_SLICE_ROOT) < 0)
+        LOG_WARN("Could not watch %s: %s", USER_SLICE_ROOT, strerror(errno));
+
+    /* For any user sessions already active, add watches recursively. */
+    setup_watches_recursive(res, USER_SLICE_ROOT, 4);
 
     return res;
 }
 
 int cgroup_resolver_scan(struct cgroup_resolver *res)
 {
-    DIR *dir = opendir(MACHINE_SLICE);
-    if (!dir) {
-        LOG_ERROR("opendir(%s): %s", MACHINE_SLICE, strerror(errno));
-        return -errno;
+    /* GC: remove entries whose leaf cgroup no longer exists. */
+    for (int i = res->count - 1; i >= 0; i--) {
+        struct ct_container *c = &res->containers[i];
+        struct stat st;
+        if (stat(c->leaf_path, &st) != 0) {
+            bpf_map_delete_elem(res->limits_map_fd, &c->cgid);
+            bpf_map_delete_elem(res->stats_map_fd,  &c->cgid);
+            LOG_INFO("container gc: name=%s id=%.12s (scope gone)",
+                     c->name, c->id);
+            res->count--;
+            if (i < res->count)
+                res->containers[i] = res->containers[res->count];
+        }
     }
 
-    int found = 0;
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL) {
-        if (ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN)
-            continue;
-        if (strncmp(ent->d_name, SCOPE_PREFIX, strlen(SCOPE_PREFIX)) != 0)
-            continue;
-        if (register_scope(res, ent->d_name) == 0)
-            found++;
-    }
-    closedir(dir);
+    int before = res->count;
+    int found  = 0;
+    scan_for_scopes(res, CGROUP_ROOT, MAX_SCAN_DEPTH, &found);
 
-    if (found > 0)
-        LOG_INFO("initial scan: %d Podman container(s) found", found);
-    else
-        LOG_INFO("initial scan: no running Podman containers");
+    int new_ct = res->count - before;
+    if (new_ct > 0)
+        LOG_INFO("scan: %d new container(s) found (%d total)",
+                 new_ct, res->count);
+    else if (res->count == 0)
+        LOG_DEBUG("scan: no running Podman containers");
 
-    return found;
+    return res->count;
 }
 
 int cgroup_resolver_process_events(struct cgroup_resolver *res)
 {
-    /* inotify_event has a variable-length name field. */
     char buf[4096]
-         __attribute__((aligned(__alignof__(struct inotify_event))));
+        __attribute__((aligned(__alignof__(struct inotify_event))));
 
     ssize_t len = read(res->inotify_fd, buf, sizeof(buf));
     if (len <= 0)
-        return 0;   /* EAGAIN = no events pending */
+        return 0;
 
     const char *ptr = buf;
     while (ptr < buf + len) {
         const struct inotify_event *ev =
             (const struct inotify_event *)ptr;
+        ptr += sizeof(*ev) + ev->len;
 
-        if (ev->len > 0) {
-            if (ev->mask & (IN_CREATE | IN_MOVED_TO)) {
-                if (ev->mask & IN_ISDIR)
-                    register_scope(res, ev->name);
-            } else if (ev->mask & (IN_DELETE | IN_MOVED_FROM)) {
-                if (ev->mask & IN_ISDIR)
-                    deregister_scope(res, ev->name);
-            }
+        /* Watched directory itself was deleted. */
+        if (ev->mask & IN_DELETE_SELF) {
+            remove_watch_by_wd(res, ev->wd);
+            continue;
         }
 
-        ptr += sizeof(struct inotify_event) + ev->len;
+        if (ev->len == 0) continue;
+
+        const char *parent = find_watch_path(res, ev->wd);
+        if (!parent) continue;
+
+        char full_path[CT_PATH_LEN];
+        snprintf(full_path, sizeof(full_path), "%s/%s", parent, ev->name);
+
+        if (ev->mask & (IN_CREATE | IN_MOVED_TO)) {
+            if (!(ev->mask & IN_ISDIR)) continue;
+
+            if (strncmp(ev->name, SCOPE_PREFIX, strlen(SCOPE_PREFIX)) == 0) {
+                register_scope_at(res, full_path);
+            } else if (should_traverse(ev->name)) {
+                /* New user session dir appeared; watch it and scan it. */
+                add_watch(res, full_path);
+                setup_watches_recursive(res, full_path, 3);
+                scan_for_scopes(res, full_path, 3, NULL);
+            }
+        } else if (ev->mask & (IN_DELETE | IN_MOVED_FROM)) {
+            if (ev->mask & IN_ISDIR)
+                if (strncmp(ev->name, SCOPE_PREFIX, strlen(SCOPE_PREFIX)) == 0)
+                    deregister_scope_at(res, full_path);
+        }
     }
     return 0;
 }
@@ -457,17 +598,26 @@ int cgroup_resolver_get_inotify_fd(const struct cgroup_resolver *res)
 const struct ct_container *cgroup_resolver_find_by_cgid(
         const struct cgroup_resolver *res, uint64_t cgid)
 {
-    for (int i = 0; i < res->count; i++) {
-        if (res->containers[i].cgid == cgid)
-            return &res->containers[i];
-    }
+    for (int i = 0; i < res->count; i++)
+        if (res->containers[i].cgid == cgid) return &res->containers[i];
     return NULL;
+}
+
+int cgroup_resolver_get_count(const struct cgroup_resolver *res)
+{
+    return res ? res->count : 0;
+}
+
+const struct ct_container *cgroup_resolver_get_container(
+        const struct cgroup_resolver *res, int idx)
+{
+    if (!res || idx < 0 || idx >= res->count) return NULL;
+    return &res->containers[idx];
 }
 
 void cgroup_resolver_destroy(struct cgroup_resolver *res)
 {
-    if (!res)
-        return;
+    if (!res) return;
     if (res->inotify_fd >= 0)
         close(res->inotify_fd);
     free(res);
